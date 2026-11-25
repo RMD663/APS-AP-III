@@ -1,0 +1,230 @@
+-- ============================================================================
+-- ROBOT VACUUM CLEANER - FORMAL VERIFICATION TEST CASE
+-- CA09 - GLOBAL ABSENCE OF DEADLOCK
+-- Description: Verifies that the composed system and its individual processes are completely deadlock-free.
+-- Language: Machine-Readable CSP (CSPM) for FDR4
+-- Team 5.2: Ryan, Caua, Wesley, Gabriel Monteiro
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. SYSTEM CONSTANTS
+-- ----------------------------------------------------------------------------
+MAX_BATTERY       = 5   -- Full battery capacity
+MIN_START_BATTERY = 2   -- Minimum battery level required to start cleaning
+LOW_BATTERY_LIMIT = 1   -- Critical threshold triggering return to base
+TOTAL_AREAS       = 2   -- Number of dirty areas to clean in one cycle
+
+-- ----------------------------------------------------------------------------
+-- 2. CHANNEL DECLARATIONS
+-- ----------------------------------------------------------------------------
+-- Initialization
+channel power_on
+channel init_sensors
+
+-- User Commands
+channel cmd_start
+channel cmd_pause
+channel cmd_resume
+channel cmd_cancel
+
+-- Navigation & Obstacle Handling
+channel move
+channel detect_obstacle
+channel avoid_obstacle
+
+-- Dirt Detection & Cleaning Unit
+channel detect_dirt
+channel start_vacuum
+channel clean_area
+channel stop_vacuum
+channel finish_cleaning
+
+-- Battery Management & Charging Station
+channel check_battery
+channel battery_ok
+channel battery_insufficient
+channel battery_low
+channel return_to_base
+channel dock_at_base
+channel start_charge
+channel charging
+channel charge_complete
+
+-- ----------------------------------------------------------------------------
+-- 3. PROCESS DECOMPOSITION
+-- ----------------------------------------------------------------------------
+
+-- 3.1 UserInterface: Models valid external user command sequences
+UserInterface = power_on -> UI_Idle
+
+UI_Idle =
+    cmd_start -> UI_Starting
+
+UI_Starting =
+    battery_ok -> UI_Active
+    []
+    battery_insufficient -> UI_Charging
+
+UI_Active =
+    cmd_pause -> UI_Paused
+    []
+    cmd_cancel -> UI_Idle
+    []
+    battery_low -> UI_Charging
+    []
+    finish_cleaning -> UI_Idle
+
+UI_Paused =
+    cmd_resume -> UI_Active
+    []
+    cmd_cancel -> UI_Idle
+
+UI_Charging =
+    charge_complete -> UI_Idle
+
+-- 3.2 Navigation: Models movement, obstacle avoidance, and docking
+Navigation =
+    move -> (
+        detect_obstacle -> avoid_obstacle -> Navigation
+        []
+        Navigation
+    )
+    []
+    return_to_base -> dock_at_base -> Navigation
+
+-- 3.3 CleaningUnit: Models vacuum motor state and mutual exclusion with charging
+CleaningUnit = CleaningUnit_Off
+
+CleaningUnit_Off =
+    start_vacuum -> CleaningUnit_On
+    []
+    start_charge -> CleaningUnit_Charging
+
+CleaningUnit_On =
+    clean_area -> stop_vacuum -> CleaningUnit_Off
+    []
+    stop_vacuum -> CleaningUnit_Off
+
+CleaningUnit_Charging =
+    charge_complete -> CleaningUnit_Off
+
+-- 3.4 BatteryManager: Monitors energy consumption, thresholds, and recharging
+BatteryManager(b) =
+    (b >= MIN_START_BATTERY & check_battery -> battery_ok -> BatteryManager(b))
+    []
+    (b < MIN_START_BATTERY & check_battery -> battery_insufficient -> BatteryCharging(b))
+    []
+    (b > LOW_BATTERY_LIMIT & move -> BatteryManager(b - 1))
+    []
+    (b > LOW_BATTERY_LIMIT & clean_area -> BatteryManager(b - 1))
+    []
+    (b <= LOW_BATTERY_LIMIT & battery_low -> BatteryCharging(b))
+
+BatteryCharging(b) =
+    return_to_base -> dock_at_base -> start_charge -> RechargeLoop(b)
+
+RechargeLoop(b) =
+    if b < MAX_BATTERY then
+        charging -> RechargeLoop(b + 1)
+    else
+        charge_complete -> BatteryManager(MAX_BATTERY)
+
+-- 3.5 Controller: Central orchestrator coordinating all subsystems
+Controller =
+    power_on -> init_sensors -> Ctrl_Idle
+
+Ctrl_Idle =
+    cmd_start -> check_battery -> (
+        battery_ok -> Ctrl_Cleaning(TOTAL_AREAS)
+        []
+        battery_insufficient -> Ctrl_Returning
+    )
+
+Ctrl_Cleaning(0) =
+    finish_cleaning -> Ctrl_Idle
+
+Ctrl_Cleaning(areas) =
+    move -> (
+        detect_obstacle -> avoid_obstacle -> Ctrl_Cleaning(areas)
+        []
+        detect_dirt -> start_vacuum -> Ctrl_Vacuuming(areas)
+        []
+        Ctrl_Cleaning(areas)
+    )
+    []
+    battery_low -> Ctrl_Returning
+    []
+    cmd_pause -> Ctrl_Paused(areas)
+    []
+    cmd_cancel -> Ctrl_Idle
+
+Ctrl_Vacuuming(areas) =
+    clean_area -> stop_vacuum -> Ctrl_Cleaning(areas - 1)
+    []
+    battery_low -> stop_vacuum -> Ctrl_Returning
+    []
+    cmd_pause -> stop_vacuum -> Ctrl_Paused(areas)
+    []
+    cmd_cancel -> stop_vacuum -> Ctrl_Idle
+
+Ctrl_Paused(areas) =
+    cmd_resume -> Ctrl_Cleaning(areas)
+    []
+    cmd_cancel -> Ctrl_Idle
+
+Ctrl_Returning =
+    return_to_base -> dock_at_base -> start_charge -> Ctrl_Charging
+
+Ctrl_Charging =
+    charging -> Ctrl_Charging
+    []
+    charge_complete -> Ctrl_Idle
+
+-- ----------------------------------------------------------------------------
+-- 4. PARALLEL COMPOSITION & SYNCHRONIZATION INTERFACES
+-- ----------------------------------------------------------------------------
+SYNC_CTRL_UI = {|
+    power_on, cmd_start, cmd_pause, cmd_resume, cmd_cancel,
+    battery_ok, battery_insufficient, battery_low,
+    finish_cleaning, charge_complete
+|}
+
+SYNC_NAV = {|
+    move, detect_obstacle, avoid_obstacle,
+    return_to_base, dock_at_base
+|}
+
+SYNC_CLEAN = {|
+    start_vacuum, clean_area, stop_vacuum,
+    start_charge, charge_complete
+|}
+
+SYNC_BAT = {|
+    check_battery, battery_ok, battery_insufficient, battery_low,
+    move, clean_area,
+    return_to_base, dock_at_base,
+    start_charge, charging, charge_complete
+|}
+
+SYS_UI    = Controller [| SYNC_CTRL_UI |] UserInterface
+SYS_NAV   = SYS_UI     [| SYNC_NAV     |] Navigation
+SYS_CLEAN = SYS_NAV    [| SYNC_CLEAN   |] CleaningUnit
+SYSTEM    = SYS_CLEAN  [| SYNC_BAT     |] BatteryManager(MAX_BATTERY)
+
+-- Visible system hiding internal sensor/check events (for CA10)
+INTERNAL_EVENTS = {| check_battery, detect_dirt |}
+SYSTEM_VISIBLE  = SYSTEM \ INTERNAL_EVENTS
+
+
+-- ----------------------------------------------------------------------------
+-- 5. VERIFICATION PROPERTY: CA09 (Deadlock Freedom)
+-- Property: The complete parallel system and each individual subsystem must
+--           never reach a global deadlock state under expected operations.
+-- ----------------------------------------------------------------------------
+assert SYSTEM                      :[deadlock free [F]]
+assert SYSTEM                      :[deadlock free [FD]]
+assert Controller                  :[deadlock free [F]]
+assert UserInterface               :[deadlock free [F]]
+assert Navigation                  :[deadlock free [F]]
+assert CleaningUnit                :[deadlock free [F]]
+assert BatteryManager(MAX_BATTERY) :[deadlock free [F]]
